@@ -557,6 +557,7 @@ void b2World::Solve(const b2TimeStep& step)
 
 	{
 		b2Timer timer;
+		OPTICK_EVENT("broadphase")
 		// Synchronize fixtures, check for out of range bodies.
 		for (b2Body* b = m_bodyList; b; b = b->GetNext())
 		{
@@ -604,122 +605,130 @@ void b2World::SolveTOI(const b2TimeStep& step)
 	}
 
 	// Find TOI events and solve them.
-	for (;;)
-	{
+	for (;;) {
+		OPTICK_EVENT("FindTOIEvents")
 		// Find the first TOI.
 		b2Contact* minContact = nullptr;
 		float minAlpha = 1.0f;
 
-		for (b2Contact* c = m_contactManager.m_contactList; c; c = c->m_next)
 		{
-			// Is this contact disabled?
-			if (c->IsEnabled() == false)
+			OPTICK_EVENT("Check contact list")
+			for (b2Contact* c = m_contactManager.m_contactList; c; c = c->m_next)
 			{
-				continue;
-			}
-
-			// Prevent excessive sub-stepping.
-			if (c->m_toiCount > b2_maxSubSteps)
-			{
-				continue;
-			}
-
-			float alpha = 1.0f;
-			if (c->m_flags & b2Contact::e_toiFlag)
-			{
-				// This contact has a valid cached TOI.
-				alpha = c->m_toi;
-			}
-			else
-			{
-				b2Fixture* fA = c->GetFixtureA();
-				b2Fixture* fB = c->GetFixtureB();
-
-				// Is there a sensor?
-				if (fA->IsSensor() || fB->IsSensor())
+				// Is this contact disabled?
+				if (c->IsEnabled() == false)
 				{
 					continue;
 				}
 
-				b2Body* bA = fA->GetBody();
-				b2Body* bB = fB->GetBody();
-
-				b2BodyType typeA = bA->m_type;
-				b2BodyType typeB = bB->m_type;
-				b2Assert(typeA == b2_dynamicBody || typeB == b2_dynamicBody);
-
-				bool activeA = bA->IsAwake() && typeA != b2_staticBody;
-				bool activeB = bB->IsAwake() && typeB != b2_staticBody;
-
-				// Is at least one body active (awake and dynamic or kinematic)?
-				if (activeA == false && activeB == false)
+				// Prevent excessive sub-stepping.
+				if (c->m_toiCount > b2_maxSubSteps)
 				{
 					continue;
 				}
 
-				bool collideA = bA->IsBullet() || typeA != b2_dynamicBody;
-				bool collideB = bB->IsBullet() || typeB != b2_dynamicBody;
-
-				// Are these two non-bullet dynamic bodies?
-				if (collideA == false && collideB == false)
+				float alpha = 1.0f;
+				if (c->m_flags & b2Contact::e_toiFlag)
 				{
-					continue;
+					// This contact has a valid cached TOI.
+					alpha = c->m_toi;
+				}
+				else {
+					b2Fixture* fA = c->GetFixtureA();
+					b2Fixture* fB = c->GetFixtureB();
+
+					// Is there a sensor?
+					if (fA->IsSensor() || fB->IsSensor())
+					{
+						continue;
+					}
+
+					b2Body* bA = fA->GetBody();
+					b2Body* bB = fB->GetBody();
+
+					b2BodyType typeA = bA->m_type;
+					b2BodyType typeB = bB->m_type;
+					b2Assert(typeA == b2_dynamicBody || typeB == b2_dynamicBody);
+
+					bool activeA = bA->IsAwake() && typeA != b2_staticBody;
+					bool activeB = bB->IsAwake() && typeB != b2_staticBody;
+
+					// Is at least one body active (awake and dynamic or kinematic)?
+					if (activeA == false && activeB == false)
+					{
+						continue;
+					}
+
+					bool collideA = bA->IsBullet() || typeA != b2_dynamicBody;
+					bool collideB = bB->IsBullet() || typeB != b2_dynamicBody;
+
+					// Are these two non-bullet dynamic bodies?
+					if (collideA == false && collideB == false)
+					{
+						continue;
+					}
+
+					// Compute the TOI for this contact.
+					// Put the sweeps onto the same time interval.
+					float alpha0 = bA->m_sweep.alpha0;
+
+					{
+						OPTICK_EVENT("m_sweep advance")
+						if (bA->m_sweep.alpha0 < bB->m_sweep.alpha0)
+						{
+							alpha0 = bB->m_sweep.alpha0;
+							bA->m_sweep.Advance(alpha0);
+						}
+						else if (bB->m_sweep.alpha0 < bA->m_sweep.alpha0)
+						{
+							alpha0 = bA->m_sweep.alpha0;
+							bB->m_sweep.Advance(alpha0);
+						}
+					}
+
+					b2Assert(alpha0 < 1.0f);
+
+					int32 indexA = c->GetChildIndexA();
+					int32 indexB = c->GetChildIndexB();
+
+					// Compute the time of impact in interval [0, minTOI]
+					b2TOIInput input;
+					input.proxyA.Set(fA->GetShape(), indexA);
+					input.proxyB.Set(fB->GetShape(), indexB);
+					input.sweepA = bA->m_sweep;
+					input.sweepB = bB->m_sweep;
+					input.tMax = 1.0f;
+
+					b2TOIOutput output;
+					{
+						OPTICK_EVENT("b2TimeOfImpact")
+						b2TimeOfImpact(&output, &input);
+					}
+
+					// Beta is the fraction of the remaining portion of the .
+					float beta = output.t;
+					if (output.state == b2TOIOutput::e_touching)
+					{
+						alpha = b2Min(alpha0 + (1.0f - alpha0) * beta, 1.0f);
+					}
+					else
+					{
+						alpha = 1.0f;
+					}
+
+					c->m_toi = alpha;
+					c->m_flags |= b2Contact::e_toiFlag;
 				}
 
-				// Compute the TOI for this contact.
-				// Put the sweeps onto the same time interval.
-				float alpha0 = bA->m_sweep.alpha0;
-
-				if (bA->m_sweep.alpha0 < bB->m_sweep.alpha0)
+				if (alpha < minAlpha)
 				{
-					alpha0 = bB->m_sweep.alpha0;
-					bA->m_sweep.Advance(alpha0);
+					// This is the minimum TOI found so far.
+					minContact = c;
+					minAlpha = alpha;
 				}
-				else if (bB->m_sweep.alpha0 < bA->m_sweep.alpha0)
-				{
-					alpha0 = bA->m_sweep.alpha0;
-					bB->m_sweep.Advance(alpha0);
-				}
-
-				b2Assert(alpha0 < 1.0f);
-
-				int32 indexA = c->GetChildIndexA();
-				int32 indexB = c->GetChildIndexB();
-
-				// Compute the time of impact in interval [0, minTOI]
-				b2TOIInput input;
-				input.proxyA.Set(fA->GetShape(), indexA);
-				input.proxyB.Set(fB->GetShape(), indexB);
-				input.sweepA = bA->m_sweep;
-				input.sweepB = bB->m_sweep;
-				input.tMax = 1.0f;
-
-				b2TOIOutput output;
-				b2TimeOfImpact(&output, &input);
-
-				// Beta is the fraction of the remaining portion of the .
-				float beta = output.t;
-				if (output.state == b2TOIOutput::e_touching)
-				{
-					alpha = b2Min(alpha0 + (1.0f - alpha0) * beta, 1.0f);
-				}
-				else
-				{
-					alpha = 1.0f;
-				}
-
-				c->m_toi = alpha;
-				c->m_flags |= b2Contact::e_toiFlag;
-			}
-
-			if (alpha < minAlpha)
-			{
-				// This is the minimum TOI found so far.
-				minContact = c;
-				minAlpha = alpha;
 			}
 		}
-
+			
 		if (minContact == nullptr || 1.0f - 10.0f * b2_epsilon < minAlpha)
 		{
 			// No more TOI events. Done!
@@ -736,17 +745,24 @@ void b2World::SolveTOI(const b2TimeStep& step)
 		b2Sweep backup1 = bA->m_sweep;
 		b2Sweep backup2 = bB->m_sweep;
 
-		bA->Advance(minAlpha);
-		bB->Advance(minAlpha);
+		{
+			OPTICK_EVENT("Advance")
+			bA->Advance(minAlpha);
+			bB->Advance(minAlpha);
+		}
 
 		// The TOI contact likely has some new contact points.
-		minContact->Update(m_contactManager.m_contactListener);
-		minContact->m_flags &= ~b2Contact::e_toiFlag;
-		++minContact->m_toiCount;
+		{
+			OPTICK_EVENT("TOIContactUpdate")
+			minContact->Update(m_contactManager.m_contactListener);
+			minContact->m_flags &= ~b2Contact::e_toiFlag;
+			++minContact->m_toiCount;
+		}
 
 		// Is the contact solid?
 		if (minContact->IsEnabled() == false || minContact->IsTouching() == false)
 		{
+			OPTICK_EVENT("SynchronizeTransform")
 			// Restore the sweeps.
 			minContact->SetEnabled(false);
 			bA->m_sweep = backup1;
@@ -755,15 +771,18 @@ void b2World::SolveTOI(const b2TimeStep& step)
 			bB->SynchronizeTransform();
 			continue;
 		}
+		
+		{
+			OPTICK_EVENT("Build the island")
+			bA->SetAwake(true);
+			bB->SetAwake(true);
 
-		bA->SetAwake(true);
-		bB->SetAwake(true);
-
-		// Build the island
-		island.Clear();
-		island.Add(bA);
-		island.Add(bB);
-		island.Add(minContact);
+			// Build the island
+			island.Clear();
+			island.Add(bA);
+			island.Add(bB);
+			island.Add(minContact);
+		}
 
 		bA->m_flags |= b2Body::e_islandFlag;
 		bB->m_flags |= b2Body::e_islandFlag;
@@ -816,11 +835,15 @@ void b2World::SolveTOI(const b2TimeStep& step)
 					b2Sweep backup = other->m_sweep;
 					if ((other->m_flags & b2Body::e_islandFlag) == 0)
 					{
+						OPTICK_EVENT("Tentatively advance ")
 						other->Advance(minAlpha);
 					}
 
 					// Update the contact points
-					contact->Update(m_contactManager.m_contactListener);
+					{
+						OPTICK_EVENT("contact update")
+						contact->Update(m_contactManager.m_contactListener);
+					}
 
 					// Was the contact disabled by the user?
 					if (contact->IsEnabled() == false)
@@ -868,7 +891,10 @@ void b2World::SolveTOI(const b2TimeStep& step)
 		subStep.positionIterations = 20;
 		subStep.velocityIterations = step.velocityIterations;
 		subStep.warmStarting = false;
-		island.SolveTOI(subStep, bA->m_islandIndex, bB->m_islandIndex);
+		{
+			OPTICK_EVENT("SolveTOI")
+			island.SolveTOI(subStep, bA->m_islandIndex, bB->m_islandIndex);
+		}
 
 		// Reset island flags and synchronize broad-phase proxies.
 		for (int32 i = 0; i < island.m_bodyCount; ++i)
@@ -881,7 +907,10 @@ void b2World::SolveTOI(const b2TimeStep& step)
 				continue;
 			}
 
-			body->SynchronizeFixtures();
+			{
+				OPTICK_EVENT("SynchronizeFixtures")
+				body->SynchronizeFixtures();
+			}
 
 			// Invalidate all contact TOIs on this displaced body.
 			for (b2ContactEdge* ce = body->m_contactList; ce; ce = ce->next)
@@ -892,7 +921,10 @@ void b2World::SolveTOI(const b2TimeStep& step)
 
 		// Commit fixture proxy movements to the broad-phase so that new contacts are created.
 		// Also, some contacts can be destroyed.
-		m_contactManager.FindNewContacts();
+		{
+			OPTICK_EVENT("FindNewContacts")
+			m_contactManager.FindNewContacts();
+		}
 
 		if (m_subStepping)
 		{
@@ -904,6 +936,7 @@ void b2World::SolveTOI(const b2TimeStep& step)
 
 void b2World::Step(float dt, int32 velocityIterations, int32 positionIterations)
 {
+	OPTICK_EVENT("world step")
 	b2Timer stepTimer;
 
 	// If new fixtures were added, we need to find the new contacts.
@@ -934,6 +967,7 @@ void b2World::Step(float dt, int32 velocityIterations, int32 positionIterations)
 	
 	// Update contacts. This is where some contacts are destroyed.
 	{
+		OPTICK_EVENT("collide")
 		b2Timer timer;
 		m_contactManager.Collide();
 		m_profile.collide = timer.GetMilliseconds();
@@ -942,6 +976,7 @@ void b2World::Step(float dt, int32 velocityIterations, int32 positionIterations)
 	// Integrate velocities, solve velocity constraints, and integrate positions.
 	if (m_stepComplete && step.dt > 0.0f)
 	{
+		OPTICK_EVENT("solve")
 		b2Timer timer;
 		Solve(step);
 		m_profile.solve = timer.GetMilliseconds();
@@ -950,6 +985,7 @@ void b2World::Step(float dt, int32 velocityIterations, int32 positionIterations)
 	// Handle TOI events.
 	if (m_continuousPhysics && step.dt > 0.0f)
 	{
+		OPTICK_EVENT("solveTOI")
 		b2Timer timer;
 		SolveTOI(step);
 		m_profile.solveTOI = timer.GetMilliseconds();
@@ -962,6 +998,7 @@ void b2World::Step(float dt, int32 velocityIterations, int32 positionIterations)
 
 	if (m_clearForces)
 	{
+		OPTICK_EVENT("ClearForces")
 		ClearForces();
 	}
 

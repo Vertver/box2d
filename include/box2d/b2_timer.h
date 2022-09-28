@@ -52,4 +52,8 @@ private:
 #endif
 };
 
+#ifdef OPTICK_ENABLED
+#include <optick.h>
+#endif
+
 #endif

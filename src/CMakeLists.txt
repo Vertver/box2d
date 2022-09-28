@@ -113,6 +113,14 @@ set_target_properties(box2d PROPERTIES
     SOVERSION ${PROJECT_VERSION_MAJOR}
 )
 
+set(BOX2D_LIBRARIES_TO_LINK)
+list(APPEND BOX2D_LIBRARIES_TO_LINK "OptickCore")
+if (MIMALLOC_ENABLED)
+	list(APPEND BOX2D_LIBRARIES_TO_LINK "mimalloc-static")
+endif()
+
+target_link_libraries(box2d PRIVATE ${BOX2D_LIBRARIES_TO_LINK})
+
 if(MSVC)
   set_target_properties(box2d PROPERTIES
     COMPILE_PDB_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
